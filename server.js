@@ -12,6 +12,7 @@ let lastSession = 0;
 let ws = null;
 let heartbeatInterval = null;
 let watchdogTimer = null;
+let reconnectTimer = null;
 let lastResultTime = Date.now();
 let isHandshakeDone = false;
 
@@ -101,7 +102,6 @@ function getPrediction() {
     let confidence = "THẤP";
     let advice = "Đánh nhẹ";
 
-    // Cầu bệt
     if (last === prev && last) {
         predict = last;
         confidence = "CAO";
@@ -112,7 +112,6 @@ function getPrediction() {
         advice = "Cân nhắc";
     }
 
-    // Thống kê xu hướng
     if (tai >= 7) {
         predict = "TÀI";
         confidence = "CAO";
@@ -154,7 +153,6 @@ function saveResult(session, dice1, dice2, dice3, hash) {
         thoi_gian: timeString
     };
 
-    // Chỉ thêm nếu chưa có phiên này
     if (!history.some(item => item.phien === session)) {
         history.unshift({
             phien: session,
@@ -173,7 +171,6 @@ function saveResult(session, dice1, dice2, dice3, hash) {
 function processPomeloPacket(pack) {
     if (pack.length < 5) return;
 
-    // Tìm route
     let routeEnd = findRouteEnd(pack, GAME_END_ROUTE);
     if (routeEnd < 0) {
         routeEnd = findRouteEnd(pack, GAME_START_ROUTE);
@@ -207,7 +204,6 @@ function processPomeloPacket(pack) {
                     const v2 = pack[offset + 1];
                     const v3 = pack[offset + 2];
                     if (v1 >= 1 && v1 <= 12 && v2 >= 1 && v2 <= 12 && v3 >= 1 && v3 <= 12) {
-                        // Nếu giá trị gấp đôi (có thể do server gửi x2)
                         const doubled = (v1 % 2 === 0 && v2 % 2 === 0 && v3 % 2 === 0);
                         diceArr = doubled ? [v1 / 2, v2 / 2, v3 / 2] : [v1, v2, v3];
                     }
@@ -235,13 +231,37 @@ function processPomeloPacket(pack) {
 function connect() {
     console.log("🌐 Đang kết nối WebSocket...");
 
-    ws = new WebSocket(WS_URL, {
-        rejectUnauthorized: false,
-        headers: {
-            Origin: 'https://68gbvn88.bar',
-            'User-Agent': 'Mozilla/5.0'
-        }
-    });
+    // Clear old connection
+    if (ws) {
+        ws.removeAllListeners();
+        ws.close();
+        ws = null;
+    }
+
+    // Clear intervals and timeouts
+    clearInterval(heartbeatInterval);
+    heartbeatInterval = null;
+    clearInterval(watchdogTimer);
+    watchdogTimer = null;
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+
+    // Reset handshake flag
+    isHandshakeDone = false;
+
+    try {
+        ws = new WebSocket(WS_URL, {
+            rejectUnauthorized: false,
+            headers: {
+                Origin: 'https://68gbvn88.bar',
+                'User-Agent': 'Mozilla/5.0'
+            }
+        });
+    } catch (err) {
+        console.log("WS creation error:", err.message);
+        reconnectTimer = setTimeout(connect, 3000);
+        return;
+    }
 
     ws.on('open', () => {
         console.log("✅ Connected");
@@ -263,13 +283,13 @@ function connect() {
                 const pack = buffer.slice(offset, offset + 4 + length);
                 offset += 4 + length;
 
-                if (pkgType === 1) { // Handshake
+                if (pkgType === 1) {
                     if (!isHandshakeDone) {
                         isHandshakeDone = true;
                         console.log("🤝 Handshake OK");
                         ws.send(Buffer.from([0x02, 0x00, 0x00, 0x00]));
 
-                        if (heartbeatInterval) clearInterval(heartbeatInterval);
+                        clearInterval(heartbeatInterval);
                         heartbeatInterval = setInterval(() => {
                             if (ws && ws.readyState === WebSocket.OPEN) {
                                 ws.send(Buffer.from([0x03, 0x00, 0x00, 0x00]));
@@ -281,7 +301,7 @@ function connect() {
                         setTimeout(() => ws.send(Buffer.from(PKT_GET_SCENE, 'base64')), 1500);
                         setTimeout(() => ws.send(Buffer.from(PKT_REQ_HISTORY, 'base64')), 2000);
 
-                        if (watchdogTimer) clearInterval(watchdogTimer);
+                        clearInterval(watchdogTimer);
                         watchdogTimer = setInterval(() => {
                             const elapsed = Math.round((Date.now() - lastResultTime) / 1000);
                             if (elapsed >= WATCHDOG_SECONDS) {
@@ -290,11 +310,11 @@ function connect() {
                             }
                         }, 5000);
                     }
-                } else if (pkgType === 3) { // Ping
+                } else if (pkgType === 3) {
                     if (ws && ws.readyState === WebSocket.OPEN) {
                         ws.send(Buffer.from([0x03, 0x00, 0x00, 0x00]));
                     }
-                } else if (pkgType === 4) { // Data
+                } else if (pkgType === 4) {
                     processPomeloPacket(pack);
                 }
             }
@@ -303,16 +323,21 @@ function connect() {
         }
     });
 
-    ws.on('close', () => {
-        console.log("❌ Disconnected");
+    ws.on('close', (code, reason) => {
+        console.log(`❌ Disconnected - code: ${code}, reason: ${String(reason)}`);
         clearInterval(heartbeatInterval);
+        heartbeatInterval = null;
         clearInterval(watchdogTimer);
-        setTimeout(connect, 3000);
+        watchdogTimer = null;
+        clearTimeout(reconnectTimer);
+        reconnectTimer = setTimeout(connect, 3000);
     });
 
     ws.on('error', (err) => {
         console.log("WS Error:", err.message);
-        if (ws) ws.terminate();
+        if (ws) {
+            ws.close(); // trigger close event for reconnect
+        }
     });
 }
 
@@ -368,4 +393,12 @@ console.log("====================================");
 server.listen(PORT, '0.0.0.0', () => {
     console.log(`✅ Server running on port ${PORT}`);
     connect();
+});
+
+// Bắt lỗi uncaught để tránh crash
+process.on('uncaughtException', (err) => {
+    console.error('[UNCAUGHT]', err.message);
+});
+process.on('unhandledRejection', (reason) => {
+    console.error('[UNHANDLED]', reason);
 });
